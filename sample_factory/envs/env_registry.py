@@ -1,3 +1,4 @@
+from sample_factory.envs import maatari
 from sample_factory.utils.utils import log
 
 ENV_REGISTRY = None
@@ -120,12 +121,18 @@ def register_default_envs(env_registry):
         from sample_factory.envs.minigrid.minigrid_params import minigrid_override_defaults
         return make_minigrid_env, None, minigrid_override_defaults
 
+    def maatari_funcs():
+        from sample_factory.envs.maatari.maatari import make_env
+        from sample_factory.envs.maatari.maatari_params import add_maatari_env_args, maatari_override_defaults
+        return make_env, add_maatari_env_args, maatari_override_defaults
+
     default_envs = {
         'doom_': doom_funcs,
         'atari_': atari_funcs,
         'dmlab_': dmlab_funcs,
         'mujoco_': mujoco_funcs,
         'MiniGrid': minigrid_funcs,
+        'maatari_': maatari_funcs
     }
 
     for envs_prefix, env_funcs in default_envs.items():
