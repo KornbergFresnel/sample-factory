@@ -1,13 +1,15 @@
-[![Build Status](https://travis-ci.org/alex-petrenko/sample-factory.svg?branch=master)](https://travis-ci.org/github/alex-petrenko/sample-factory)
-[![codecov](https://codecov.io/gh/alex-petrenko/sample-factory/branch/master/graph/badge.svg)](https://codecov.io/gh/alex-petrenko/sample-factory)
+[![Build Status](https://travis-ci.com/alex-petrenko/sample-factory.svg?branch=master)](https://travis-ci.com/github/alex-petrenko/sample-factory)
 [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/alex-petrenko/sample-factory/blob/master/LICENSE)
 [![Downloads](https://pepy.tech/badge/sample-factory)](https://pepy.tech/project/sample-factory)
+<!-- [![codecov](https://codecov.io/gh/alex-petrenko/sample-factory/branch/master/graph/badge.svg)](https://codecov.io/gh/alex-petrenko/sample-factory) -->
 
 # Sample Factory
 
 Codebase for high throughput asynchronous reinforcement learning.
 
 **Paper:** https://arxiv.org/abs/2006.11751
+
+**Cite:** [BibTeX](https://github.com/alex-petrenko/sample-factory#citation)
 
 **Talk:** https://youtu.be/lLG17LKKSZc
 
@@ -22,7 +24,7 @@ VizDoom agents trained with Sample Factory playing in real time:
 
 #### When should I use Sample Factory?
 
-1. Sample Factory is the fastest open source single-machine RL implementations (see paper for details).
+1. Sample Factory is one of the fastest open source single-machine RL implementations (see paper for details).
 If you plan to train RL agents on large amounts of experience, consider using it.
 Sample Factory can significantly speed up
 the experimentation or allow you to collect more samples in the same amount of time and achieve better performance.
@@ -37,6 +39,50 @@ Consider using Sample Factory if you train agents in these environments.
 4. Sample Factory can be a good choice as a prototype for a single node in a distributed RL system or as a reference
 codebase for other types of async RL algorithms.
 
+## Recent releases
+
+##### v1.122.0 (not yet on PyPI)
+
+* Added adaptive learning rate scheduler
+* Added default PyTorch model tensor initialization 
+
+##### v1.121.4
+* Support Weights and Biases (see section "WandB support")
+* More configurable population-based training: 
+can set from command line whether or not to mutate gamma, plus the perturbation magnitude for all float hyperparams can also be set from command line:
+```
+--pbt_optimize_gamma: Whether to optimize gamma, discount factor, or not (experimental) (default: False)
+--pbt_perturb_min: When PBT mutates a float hyperparam, it samples the change magnitude randomly from the uniform distribution [pbt_perturb_min, pbt_perturb_max] (default: 1.05)
+--pbt_perturb_max: When PBT mutates a float hyperparam, it samples the change magnitude randomly from the uniform distribution [pbt_perturb_min, pbt_perturb_max] (default: 1.5)
+```
+
+##### v1.121.3
+* Fixed a small bug related to population-based training (a reward shaping dictionary was assumed to be a flat dict,
+while it could be a nested dict in some envs)
+
+##### v1.121.2
+* Fixed a bug that prevented Vizdoom *.cfg and *.wad files from being copied to site-packages during installation from PyPI
+* Added example on how to use custom Vizdoom envs without modifying the source code (`sample_factory_examples/train_custom_vizdoom_env.py`)
+
+##### v1.121.0
+* Added fixed KL divergence penalty as in https://arxiv.org/pdf/1707.06347.pdf 
+Its usage is highly encouraged in environments with continuous action spaces (i.e. set --kl_loss_coeff=1.0).
+Otherwise numerical instabilities can occur in certain environments, especially when the policy lag is high
+
+* More summaries related to the new loss
+
+##### v1.120.2
+* More improvements and fixes in runner interface, including support for NGC cluster
+
+##### v1.120.1
+* Runner interface improvements for Slurm
+
+##### v1.120.0
+* Support inactive agents. Do deactivate an agent for a portion of the episode the environment should return `info={'is_active': False}` for the inactive agent. Useful for environments such as hide-n-seek.
+* Improved memory consumption and performance with better shared memory management.
+* Experiment logs are now saved into the experiment folder as `sf_log.txt`
+* DMLab-related bug fixes (courtesy of @donghoonlee04 and @sungwoong. Thank you!)
+
 ## Installation
 
 Just install from PyPI:
@@ -46,7 +92,7 @@ Just install from PyPI:
 #### Advanced installation
 
 PyPI dependency resolution may result in suboptimal performance, i.e. some versions of MKL and Numpy are known to be slower.
-To guarantee the maximum throughput (up to 10% faster than pip version) consider using our Conda environment with exact package versions:
+To guarantee the maximum throughput (~10% faster than pip version) consider using our Conda environment with exact package versions:
 
 - Clone the repo: `git clone https://github.com/alex-petrenko/sample-factory.git`
 
@@ -79,25 +125,9 @@ Sample Factory comes with a particularly comprehensive support for VizDoom and D
 
 #### VizDoom
 
-Follow these steps to add support for VizDoom environments
-
-- Install Linux dependencies (from [VizDoom linux_deps](https://github.com/mwydmuch/ViZDoom/blob/master/doc/Building.md#linux_deps)):
-
-```
-# ZDoom dependencies
-sudo apt install build-essential zlib1g-dev libsdl2-dev libjpeg-dev \
-nasm tar libbz2-dev libgtk2.0-dev cmake git libfluidsynth-dev libgme-dev \
-libopenal-dev timidity libwildmidi-dev unzip cmake
-
-# VizDoom dependencies
-sudo apt install libboost-all-dev python3-dev python3-pip
-```
-
-- Install VizDoom Python API: 
-`pip install git+https://github.com/alex-petrenko/ViZDoom@doom_bot_project#egg=vizdoom`
-
-It is important that you install this version and not the version from pip. It contains important fixes 
-that allow us to add support for multi-agent environments.
+To install VizDoom just follow system setup instructions from the original repository ([VizDoom linux_deps](https://github.com/mwydmuch/ViZDoom/blob/master/doc/Building.md#linux_deps)),
+after which the latest VizDoom can be installed from PyPI: ```pip install vizdoom```.
+Version 1.1.9 or above is recommended as it fixes bugs related to multi-agent training.
 
 #### DMLab
  
@@ -112,6 +142,8 @@ Command lines for running experiments with these datasets are provided in the se
  
 ALE envs are supported out-of-the-box, although the existing wrappers and hyperparameters
 aren't well optimized for sample efficiency in Atari. Tuned Atari training examples would be a welcome contribution.
+
+Since ~2022 some extra steps might be required to install atari: `pip install "gym[atari,accept-rom-license]"`
  
 #### Custom multi-agent environments
 
@@ -284,6 +316,30 @@ Sample Factory uses Tensorboard summaries. Run Tensorboard to monitor your exper
 Additionally, we provide a helper script that has nice command line interface to monitor the experiment folders 
 using wildcard masks: `python -m sample_factory.tb '*custom_experiment*' '*another*custom*experiment_name'`
 
+#### WandB support
+
+Sample Factory also supports experiment monitoring with Weights and Biases.
+In order to setup WandB locally run `wandb login` in the terminal (https://docs.wandb.ai/quickstart#1.-set-up-wandb)
+
+Example command line to run an experiment with WandB monitoring:
+
+```
+python -m sample_factory.algorithms.appo.train_appo --env=doom_basic --algo=APPO --train_for_env_steps=30000000 --num_workers=20 --num_envs_per_worker=20 --experiment=doom_basic --with_wandb=True --wandb_user=<your_wandb_user> --wandb_tags test benchmark doom appo
+```
+
+A total list of WandB settings: 
+```
+--with_wandb: Enables Weights and Biases integration (default: False)
+--wandb_user: WandB username (entity). Must be specified from command line! Also see https://docs.wandb.ai/quickstart#1.-set-up-wandb (default: None)
+--wandb_project: WandB "Project" (default: sample_factory)
+--wandb_group: WandB "Group" (to group your experiments). By default this is the name of the env. (default: None)
+--wandb_job_type: WandB job type (default: SF)
+--wandb_tags: [WANDB_TAGS [WANDB_TAGS ...]] Tags can help with finding experiments in WandB web console (default: [])
+```
+
+Once the experiment is started the link to the monitored session is going to be available in the logs (or by searching in Wandb Web console).
+
+
 ### Runner interface
 
 Sample Factory provides a simple interface that allows users to run experiments with multiple seeds
@@ -313,6 +369,9 @@ RUN_DESCRIPTION = RunDescription('doom_basic_envs_appo', experiments=_experiment
 
 ```
 
+Runner script should be importable (i.e. be in your project or in PYTHONPATH), and should define a single variable
+`RUN_DESCRIPTION`, which contains a list of experiments (each experiment can be a hyperparameter search), as well as some auxiliary parameters.
+
 When such a script is saved i.e. at `myproject/train_10_seeds.py` in your project using Sample Factory, you can use this command to
 execute it:
 
@@ -320,11 +379,14 @@ execute it:
 python -m sample_factory.runner.run --run=myproject.train_10_seeds --runner=processes --max_parallel=12 --pause_between=10 --experiments_per_gpu=3 --num_gpus=4
 ``` 
 
-This will cycle through the requested configurations, training 12 experiments at the same time, 3 per GPU on 4 GPUs.
-Use `--runner=slurm` for basic Slurm support (experimental).
+This will cycle through the requested configurations, training 12 experiments at the same time, 3 per GPU on 4 GPUs using local OS-level parallelism.
+
+Runner supports other backends for parallel execution: `--runner=slurm` and `--runner=ngc` for Slurm and NGC support respectively.
 
 Individual experiments will be stored in `train_dir/run_name` so the whole experiment can be easily monitored
 with a single Tensorboard command.
+
+Find more information on runner API in [runner/README.md](https://github.com/alex-petrenko/sample-factory/blob/master/sample_factory/runner/README.md).
 
 ### Dummy sampler
 
@@ -342,13 +404,11 @@ python -m sample_factory.run_algorithm --algo=DUMMY_SAMPLER --env=doom_benchmark
 To run unit tests execute `./all_tests.sh` from the root of the repo.
 Consider installing VizDoom for a more comprehensive set of tests.
 
-### Caveats
+### Trained policies
 
-- We never change the policy that generates the actions in the middle of the rollout!
-The policy index (in PBT scenarios) is only changed between rollouts.
-This means that a little bit of experience in the beginning of the next rollout can be collected
-by another policy. It never matters when rollout << episode_len, but if the rollouts are long and
-episodes are short, you might need to address this. See `finalize_trajectory()` in `actor_worker.py` docs for details.
+See a separate [trained_policies/README.md](https://github.com/alex-petrenko/sample-factory/blob/master/trained_policies/README.md).
+
+### Caveats
 
 - Multiplayer VizDoom environments can freeze your console sometimes, simple `reset` takes care of this
 - Sometimes VizDoom instances don't clear their internal shared memory buffers used to communicate between Python and

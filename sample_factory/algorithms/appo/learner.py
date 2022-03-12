@@ -1,4 +1,5 @@
-from typing import Tuple
+from abc import abstractmethod, ABC
+from typing import Tuple, Optional
 import glob
 import os
 import shutil
@@ -23,7 +24,8 @@ else:
 
 from sample_factory.algorithms.appo.appo_utils import TaskType, list_of_dicts_to_dict_of_lists, memory_stats, cuda_envvars_for_policy, \
     TensorBatcher, iter_dicts_recursively, copy_dict_structure, ObjectPool
-from sample_factory.algorithms.appo.model import CPCA, create_actor_critic
+from sample_factory.algorithms.appo.model import create_actor_critic
+from sample_factory.algorithms.appo.aux_losses import CPCA
 from sample_factory.algorithms.appo.population_based_training import PbtTask
 from sample_factory.algorithms.utils.action_distributions import get_action_distribution, is_continuous_action_space
 from sample_factory.algorithms.utils.algo_utils import calculate_gae, EPS
@@ -55,7 +57,7 @@ def _build_pack_info_from_dones(dones: torch.Tensor, T: int) -> Tuple[torch.Tens
 
     rollout_boundaries = dones.clone().detach()
     rollout_boundaries[T - 1::T] = 1  # end of each rollout is the boundary
-    rollout_boundaries = rollout_boundaries.nonzero().squeeze(dim=1) + 1
+    rollout_boundaries = rollout_boundaries.nonzero(as_tuple=False).squeeze(dim=1) + 1
 
     first_len = rollout_boundaries[0].unsqueeze(0)
 
@@ -180,6 +182,70 @@ def build_core_out_from_seq(x_seq: PackedSequence, inverted_select_inds):
     return x_seq.data.index_select(0, inverted_select_inds)
 
 
+class LearningRateScheduler:
+    def update(self, current_lr, recent_kls):
+        return current_lr
+
+    def invoke_after_each_minibatch(self):
+        return False
+
+    def invoke_after_each_epoch(self):
+        return False
+
+
+class KlAdaptiveScheduler(LearningRateScheduler, ABC):
+    def __init__(self, cfg):
+        self.lr_schedule_kl_threshold = cfg.lr_schedule_kl_threshold
+        self.min_lr = 1e-6
+        self.max_lr = 1e-2
+
+    @abstractmethod
+    def num_recent_kls_to_use(self) -> int:
+        pass
+
+    def update(self, current_lr, recent_kls):
+        num_kls_to_use = self.num_recent_kls_to_use()
+        kls = recent_kls[-num_kls_to_use:]
+        mean_kl = np.mean(kls)
+        lr = current_lr
+        if mean_kl > 2.0 * self.lr_schedule_kl_threshold:
+            lr = max(current_lr / 1.5, self.min_lr)
+        if mean_kl < (0.5 * self.lr_schedule_kl_threshold):
+            lr = min(current_lr * 1.5, self.max_lr)
+        return lr
+
+
+class KlAdaptiveSchedulerPerMinibatch(KlAdaptiveScheduler):
+    def num_recent_kls_to_use(self) -> int:
+        return 1
+
+    def invoke_after_each_minibatch(self):
+        return True
+
+
+class KlAdaptiveSchedulerPerEpoch(KlAdaptiveScheduler):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.num_minibatches_per_epoch = cfg.num_batches_per_iteration
+
+    def num_recent_kls_to_use(self) -> int:
+        return self.num_minibatches_per_epoch
+
+    def invoke_after_each_epoch(self):
+        return True
+
+
+def get_lr_scheduler(cfg) -> LearningRateScheduler:
+    if cfg.lr_schedule == 'constant':
+        return LearningRateScheduler()
+    elif cfg.lr_schedule == 'kl_adaptive_minibatch':
+        return KlAdaptiveSchedulerPerMinibatch(cfg)
+    elif cfg.lr_schedule == 'kl_adaptive_epoch':
+        return KlAdaptiveSchedulerPerEpoch(cfg)
+    else:
+        raise RuntimeError(f'Unknown scheduler {cfg.lr_schedule}')
+
+
 class LearnerWorker:
     def __init__(
         self, worker_idx, policy_id, cfg, obs_space, action_space, report_queue, policy_worker_queues, shared_buffers,
@@ -195,7 +261,7 @@ class LearnerWorker:
         # PBT-related stuff
         self.should_save_model = True  # set to true if we need to save the model to disk on the next training iteration
         self.load_policy_id = None  # non-None when we need to replace our parameters with another policy's parameters
-        self.pbt_mutex = threading.Lock()
+        self.pbt_mutex = None  # deferred initialization
         self.new_cfg = None  # non-None when we need to update the learning hyperparameters
 
         self.terminate = False
@@ -204,10 +270,12 @@ class LearnerWorker:
         self.obs_space = obs_space
         self.action_space = action_space
 
-        self.rollout_tensors = shared_buffers.tensors
-        self.traj_tensors_available = shared_buffers.is_traj_tensor_available
-        self.policy_versions = shared_buffers.policy_versions
-        self.stop_experience_collection = shared_buffers.stop_experience_collection
+        self.shared_buffers = shared_buffers
+
+        # deferred initialization
+        self.rollout_tensors = None
+        self.policy_versions = None
+        self.stop_experience_collection = None
 
         self.stop_experience_collection_num_msgs = self.resume_experience_collection_num_msgs = 0
 
@@ -217,6 +285,8 @@ class LearnerWorker:
         self.optimizer = None
         self.policy_lock = policy_lock
         self.resume_experience_collection_cv = resume_experience_collection_cv
+
+        self.lr_scheduler: Optional[LearningRateScheduler] = None
 
         self.task_queue = MpQueue()
         self.report_queue = report_queue
@@ -231,25 +301,24 @@ class LearnerWorker:
         # we send weight updates via these queues
         self.policy_worker_queues = policy_worker_queues
 
-        self.experience_buffer_queue = Queue()
+        self.experience_buffer_queue = None  # deferred initialization
 
-        self.tensor_batch_pool = ObjectPool()
-        self.tensor_batcher = TensorBatcher(self.tensor_batch_pool)
+        self.tensor_batch_pool = self.tensor_batcher = None
 
         self.with_training = True  # set to False for debugging no-training regime
         self.train_in_background = self.cfg.train_in_background_thread  # set to False for debugging
 
-        self.training_thread = Thread(target=self._train_loop) if self.train_in_background else None
-        self.train_thread_initialized = threading.Event()
+        self.training_thread = None
+        self.train_thread_initialized = None
 
         self.is_training = False
 
         self.train_step = self.env_steps = 0
 
         # decay rate at which summaries are collected
-        # save summaries every 20 seconds in the beginning, but decay to every 4 minutes in the limit, because we
+        # save summaries every 5 seconds in the beginning, but decay to every 4 minutes in the limit, because we
         # do not need frequent summaries for longer experiments
-        self.summary_rate_decay_seconds = LinearDecay([(0, 20), (100000, 120), (1000000, 240)])
+        self.summary_rate_decay_seconds = LinearDecay([(0, 5), (100000, 120), (1000000, 240)])
         self.last_summary_time = 0
 
         self.last_saved_time = self.last_milestone_time = 0
@@ -264,17 +333,46 @@ class LearnerWorker:
             raise NotImplementedError('KL-divergence exploration loss is not supported with '
                                       'continuous action spaces. Use entropy exploration loss')
 
-        if self.cfg.exploration_loss_coeff == 0.0:
-            self.exploration_loss_func = lambda action_distr: 0.0
-        elif self.cfg.exploration_loss == 'entropy':
-            self.exploration_loss_func = self.entropy_exploration_loss
-        elif self.cfg.exploration_loss == 'symmetric_kl':
-            self.exploration_loss_func = self.symmetric_kl_exploration_loss
-        else:
-            raise NotImplementedError(f'{self.cfg.exploration_loss} not supported!')
+        # deferred initialization
+        self.exploration_loss_func = None
+        self.kl_loss_func = None
 
     def start_process(self):
         self.process.start()
+
+    def deferred_initialization(self):
+        self.rollout_tensors = self.shared_buffers.tensors
+        self.policy_versions = self.shared_buffers.policy_versions
+        self.stop_experience_collection = self.shared_buffers.stop_experience_collection
+
+        self.pbt_mutex = threading.Lock()
+        self.experience_buffer_queue = Queue()
+
+        self.tensor_batch_pool = ObjectPool()
+        self.tensor_batcher = TensorBatcher(self.tensor_batch_pool)
+
+        self.training_thread = Thread(target=self._train_loop) if self.train_in_background else None
+        self.train_thread_initialized = threading.Event()
+
+        if self.cfg.exploration_loss_coeff == 0.0:
+            self.exploration_loss_func = lambda action_distr, valids: 0.0
+        elif self.cfg.exploration_loss == 'entropy':
+            self.exploration_loss_func = self._entropy_exploration_loss
+        elif self.cfg.exploration_loss == 'symmetric_kl':
+            self.exploration_loss_func = self._symmetric_kl_exploration_loss
+        else:
+            raise NotImplementedError(f'{self.cfg.exploration_loss} not supported!')
+
+        if self.cfg.kl_loss_coeff == 0.0:
+            if is_continuous_action_space(self.action_space):
+                log.warning(
+                    'WARNING! It is recommended to enable Fixed KL loss (https://arxiv.org/pdf/1707.06347.pdf) for continuous action tasks. '
+                    'I.e. set --kl_loss_coeff=1.0'
+                )
+                time.sleep(3.0)
+            self.kl_loss_func = lambda action_space, action_logits, distribution, valids: 0.0
+        else:
+            self.kl_loss_func = self._kl_loss
 
     def _init(self):
         log.info('Waiting for the learner to initialize...')
@@ -300,9 +398,9 @@ class LearnerWorker:
         Perhaps should be re-implemented in PyTorch tensors, similar to V-trace for uniformity.
         """
 
-        rewards = torch.stack(buffer.rewards).numpy().squeeze()  # [E, T]
-        dones = torch.stack(buffer.dones).numpy().squeeze()  # [E, T]
-        values_arr = torch.stack(buffer.values).numpy().squeeze()  # [E, T]
+        rewards = np.stack(buffer.rewards).squeeze()  # [E, T]
+        dones = np.stack(buffer.dones).squeeze()  # [E, T]
+        values_arr = np.stack(buffer.values).squeeze()  # [E, T]
 
         # calculating fake values for the last step in the rollout
         # this will make sure that advantage of the very last action is always zero
@@ -329,10 +427,6 @@ class LearnerWorker:
         buffer.returns = [torch.tensor(buffer.returns).reshape(-1)]
 
         return buffer
-
-    def _mark_rollout_buffer_free(self, rollout):
-        r = rollout
-        self.traj_tensors_available[r.worker_idx, r.split_idx, r.env_idx, r.agent_idx, r.traj_buffer_idx] = 1
 
     def _prepare_train_buffer(self, rollouts, macro_batch_size, timing):
         trajectories = [AttrDict(r['t']) for r in rollouts]
@@ -364,8 +458,7 @@ class LearnerWorker:
             buffer = self.tensor_batcher.cat(buffer, macro_batch_size, use_pinned_memory, timing)
 
         with timing.add_time('buff_ready'):
-            for r in rollouts:
-                self._mark_rollout_buffer_free(r)
+            self.shared_buffers.free_trajectory_buffers([r.traj_buffer_idx for r in rollouts])
 
         with timing.add_time('tensors_gpu_float'):
             device_buffer = self._copy_train_data_to_device(buffer)
@@ -373,7 +466,7 @@ class LearnerWorker:
         with timing.add_time('squeeze'):
             # will squeeze actions only in simple categorical case
             tensors_to_squeeze = [
-                'actions', 'log_prob_actions', 'policy_version', 'values',
+                'actions', 'log_prob_actions', 'policy_version', 'policy_id', 'values',
                 'rewards', 'dones', 'rewards_cpu', 'dones_cpu',
             ]
             for tensor_name in tensors_to_squeeze:
@@ -420,23 +513,39 @@ class LearnerWorker:
         if len(rollouts) < rollouts_in_macro_batch:
             return rollouts
 
-        discard_rollouts = 0
+        to_discard = 0
+        to_process = []
         policy_version = self.train_step
         for r in rollouts:
-            rollout_min_version = r['t']['policy_version'].min().item()
-            if policy_version - rollout_min_version >= self.cfg.max_policy_lag:
-                discard_rollouts += 1
-                self._mark_rollout_buffer_free(r)
+            mask = r.t['policy_id'] == self.policy_id
+            if np.any(mask):
+                rollout_newest_version = r.t['policy_version'][mask].max().item()
             else:
-                break
+                log.error(
+                    'Learner %d got a rollout without any transitions produced by policy %d. This must be a bug.',
+                    self.policy_id, self.policy_id,
+                )
+                log.error('Rollout policy ids: %r', r.t['policy_id'])
+                rollout_newest_version = policy_version - self.cfg.max_policy_lag
 
-        if discard_rollouts > 0:
+            if policy_version - rollout_newest_version >= self.cfg.max_policy_lag:
+                # the entire rollout is too old, discard it!
+                to_discard += 1
+                self.shared_buffers.free_trajectory_buffers([r.traj_buffer_idx])
+            else:
+                # There is some experience in the rollout that we can learn from.
+                # Old experience (older than max policy lag), experience from other policies (in case of policy
+                # change on episode boundary), and experience from inactive agents (policy id = -1) will be masked
+                # out during loss calculations.
+                to_process.append(r)
+
+        if to_discard > 0:
             log.warning(
                 'Discarding %d old rollouts, cut by policy lag threshold %d (learner %d)',
-                discard_rollouts, self.cfg.max_policy_lag, self.policy_id,
+                to_discard, self.cfg.max_policy_lag, self.policy_id,
             )
-            rollouts = rollouts[discard_rollouts:]
-            self.num_discarded_rollouts += discard_rollouts
+            rollouts = to_process
+            self.num_discarded_rollouts += to_discard
 
         if len(rollouts) >= rollouts_in_macro_batch:
             # process newest rollouts
@@ -558,38 +667,61 @@ class LearnerWorker:
                 self.last_milestone_time = time.time()
 
     @staticmethod
-    def _policy_loss(ratio, adv, clip_ratio_low, clip_ratio_high):
+    def _policy_loss(ratio, adv, clip_ratio_low, clip_ratio_high, valids):
         clipped_ratio = torch.clamp(ratio, clip_ratio_low, clip_ratio_high)
         loss_unclipped = ratio * adv
         loss_clipped = clipped_ratio * adv
         loss = torch.min(loss_unclipped, loss_clipped)
+        loss = torch.masked_select(loss, valids)
         loss = -loss.mean()
 
         return loss
 
-    def _value_loss(self, new_values, old_values, target, clip_value):
+    def _value_loss(self, new_values, old_values, target, clip_value, valids):
         value_clipped = old_values + torch.clamp(new_values - old_values, -clip_value, clip_value)
         value_original_loss = (new_values - target).pow(2)
         value_clipped_loss = (value_clipped - target).pow(2)
         value_loss = torch.max(value_original_loss, value_clipped_loss)
+        value_loss = torch.masked_select(value_loss, valids)
         value_loss = value_loss.mean()
+
         value_loss *= self.cfg.value_loss_coeff
 
         return value_loss
 
-    def entropy_exploration_loss(self, action_distribution):
+    def _kl_loss(self, action_space, action_logits, action_distribution, valids):
+        old_action_distribution = get_action_distribution(action_space, action_logits)
+        kl_loss = action_distribution.kl_divergence(old_action_distribution)
+        kl_loss = torch.masked_select(kl_loss, valids)
+        kl_loss = kl_loss.mean()
+
+        kl_loss *= self.cfg.kl_loss_coeff
+
+        return kl_loss
+
+    def _entropy_exploration_loss(self, action_distribution, valids):
         entropy = action_distribution.entropy()
+        entropy = torch.masked_select(entropy, valids)
         entropy_loss = -self.cfg.exploration_loss_coeff * entropy.mean()
         return entropy_loss
 
-    def symmetric_kl_exploration_loss(self, action_distribution):
+    def _symmetric_kl_exploration_loss(self, action_distribution, valids):
         kl_prior = action_distribution.symmetric_kl_with_uniform_prior()
-        kl_prior = kl_prior.mean()
+        kl_prior = torch.masked_select(kl_prior, valids).mean()
         if not torch.isfinite(kl_prior):
             kl_prior = torch.zeros(kl_prior.shape)
         kl_prior = torch.clamp(kl_prior, max=30)
         kl_prior_loss = self.cfg.exploration_loss_coeff * kl_prior
         return kl_prior_loss
+
+    def _curr_lr(self):
+        for param_group in self.optimizer.param_groups:
+            return param_group['lr']
+
+    def _update_lr(self, new_lr):
+        if new_lr != self._curr_lr():
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = new_lr
 
     def _prepare_observations(self, obs_tensors, gpu_buffer_obs):
         for d, gpu_d, k, v, _ in iter_dicts_recursively(obs_tensors, gpu_buffer_obs):
@@ -614,10 +746,15 @@ class LearnerWorker:
 
     def _train(self, gpu_buffer, batch_size, experience_size, timing):
         with torch.no_grad():
+            policy_version_before_train = self.train_step
+
             early_stopping_tolerance = 1e-6
             early_stop = False
             prev_epoch_actor_loss = 1e9
             epoch_actor_losses = []
+
+            # recent mean KL-divergences per minibatch, this used by LR schedulers
+            recent_kls = []
 
             # V-trace parameters
             # noinspection PyArgumentList
@@ -682,13 +819,6 @@ class LearnerWorker:
                         core_outputs, _ = self.actor_critic.forward_core(head_outputs, rnn_states)
 
                 num_trajectories = head_outputs.size(0) // recurrence
-                if self.aux_loss_module is not None:
-                    with timing.add_time('aux_loss'):
-                        aux_loss = self.aux_loss_module(mb.actions.view(num_trajectories, recurrence, -1),
-                                                       (1.0 - mb.dones).view(num_trajectories, recurrence, 1),
-                                                       head_outputs.view(num_trajectories, recurrence, -1),
-                                                       core_outputs.view(num_trajectories, recurrence, -1)
-                                                       )
 
                 with timing.add_time('tail'):
                     assert core_outputs.shape[0] == head_outputs.shape[0]
@@ -706,6 +836,12 @@ class LearnerWorker:
                     values = result.values.squeeze()
 
                 with torch.no_grad():  # these computations are not the part of the computation graph
+                    # ignore experience from other agents (i.e. on episode boundary) and from inactive agents
+                    valids = mb.policy_id == self.policy_id
+
+                    # ignore experience that was older than the threshold even before training started
+                    valids = valids & (policy_version_before_train - mb.policy_version < self.cfg.max_policy_lag)
+
                     if self.cfg.with_vtrace:
                         ratios_cpu = ratio.cpu()
                         values_cpu = values.cpu()
@@ -751,29 +887,49 @@ class LearnerWorker:
                     adv = adv.to(self.device)
 
                 with timing.add_time('losses'):
-                    policy_loss = self._policy_loss(ratio, adv, clip_ratio_low, clip_ratio_high)
+                    policy_loss = self._policy_loss(ratio, adv, clip_ratio_low, clip_ratio_high, valids)
+                    exploration_loss = self.exploration_loss_func(action_distribution, valids)
+                    kl_loss = self.kl_loss_func(self.actor_critic.action_space, mb.action_logits, action_distribution, valids)
 
-                    exploration_loss = self.exploration_loss_func(action_distribution)
-                    actor_loss = policy_loss + exploration_loss
+                    actor_loss = policy_loss + exploration_loss + kl_loss
                     epoch_actor_losses.append(actor_loss.item())
 
                     targets = targets.to(self.device)
                     old_values = mb.values
-                    value_loss = self._value_loss(values, old_values, targets, clip_value)
+                    value_loss = self._value_loss(values, old_values, targets, clip_value, valids)
                     critic_loss = value_loss
 
                     loss = actor_loss + critic_loss
 
+                    if self.aux_loss_module is not None:
+                        with timing.add_time('aux_loss'):
+                            aux_loss = self.aux_loss_module(
+                                mb.actions.view(num_trajectories, recurrence, -1),
+                                (1.0 - mb.dones).view(num_trajectories, recurrence, 1),
+                                valids.view(num_trajectories, recurrence, -1),
+                                head_outputs.view(num_trajectories, recurrence, -1),
+                                core_outputs.view(num_trajectories, recurrence, -1),
+                            )
+
+                            loss = loss + aux_loss
+
                     high_loss = 30.0
-                    if abs(to_scalar(policy_loss)) > high_loss or abs(to_scalar(value_loss)) > high_loss or abs(to_scalar(exploration_loss)) > high_loss:
+                    if abs(to_scalar(policy_loss)) > high_loss or abs(to_scalar(value_loss)) > high_loss or abs(to_scalar(exploration_loss)) > high_loss or abs(to_scalar(kl_loss)) > high_loss:
                         log.warning(
-                            'High loss value: %.4f %.4f %.4f %.4f (recommended to adjust the --reward_scale parameter)',
-                            to_scalar(loss), to_scalar(policy_loss), to_scalar(value_loss), to_scalar(exploration_loss),
+                            'High loss value: l:%.4f pl:%.4f vl:%.4f exp_l:%.4f kl_l:%.4f (recommended to adjust the --reward_scale parameter)',
+                            to_scalar(loss), to_scalar(policy_loss), to_scalar(value_loss), to_scalar(exploration_loss), to_scalar(kl_loss),
                         )
                         force_summaries = True
 
-                    if self.aux_loss_module is not None:
-                        loss = loss + aux_loss
+                with timing.add_time('kl_divergence'):
+                    # calculate KL-divergence with the behaviour policy action distribution
+                    old_action_distribution = get_action_distribution(
+                        self.actor_critic.action_space, mb.action_logits,
+                    )
+
+                    kl_old = action_distribution.kl_divergence(old_action_distribution)
+                    kl_old_mean = kl_old.mean().item()
+                    recent_kls.append(kl_old_mean)
 
                 # update the weights
                 with timing.add_time('update'):
@@ -802,6 +958,9 @@ class LearnerWorker:
                     with timing.add_time('after_optimizer'):
                         self._after_optimizer_step()
 
+                        if self.lr_scheduler.invoke_after_each_minibatch():
+                            self._update_lr(self.lr_scheduler.update(self._curr_lr(), recent_kls))
+
                         # collect and report summaries
                         with_summaries = self._should_save_summaries() or force_summaries
                         if with_summaries and not summary_this_epoch:
@@ -810,6 +969,9 @@ class LearnerWorker:
                             force_summaries = False
 
             # end of an epoch
+            if self.lr_scheduler.invoke_after_each_epoch():
+                self._update_lr(self.lr_scheduler.update(self._curr_lr(), recent_kls))
+
             # this will force policy update on the inference worker (policy worker)
             self.policy_versions[self.policy_id] = self.train_step
 
@@ -834,6 +996,11 @@ class LearnerWorker:
         self.last_summary_time = time.time()
         stats = AttrDict()
 
+        stats.lr = self._curr_lr()
+
+        stats.valids_fraction = var.valids.float().mean()
+        stats.same_policy_fraction = (var.mb.policy_id == self.policy_id).float().mean()
+
         grad_norm = sum(
             p.grad.data.norm(2).item() ** 2
             for p in self.actor_critic.parameters()
@@ -844,6 +1011,7 @@ class LearnerWorker:
         stats.value = var.result.values.mean()
         stats.entropy = var.action_distribution.entropy().mean()
         stats.policy_loss = var.policy_loss
+        stats.kl_loss = var.kl_loss
         stats.value_loss = var.value_loss
         stats.exploration_loss = var.exploration_loss
         if self.aux_loss_module is not None:
@@ -866,14 +1034,8 @@ class LearnerWorker:
             value_delta = torch.abs(var.values - var.old_values)
             value_delta_avg, value_delta_max = value_delta.mean(), value_delta.max()
 
-            # calculate KL-divergence with the behaviour policy action distribution
-            old_action_distribution = get_action_distribution(
-                self.actor_critic.action_space, var.mb.action_logits,
-            )
-            kl_old = var.action_distribution.kl_divergence(old_action_distribution)
-            kl_old_mean = kl_old.mean()
-
-            stats.kl_divergence = kl_old_mean
+            stats.kl_divergence = var.kl_old_mean
+            stats.kl_divergence_max = var.kl_old.max()
             stats.value_delta = value_delta_avg
             stats.value_delta_max = value_delta_max
             stats.fraction_clipped = ((var.ratio < var.clip_ratio_low).float() + (var.ratio > var.clip_ratio_high).float()).mean()
@@ -888,7 +1050,7 @@ class LearnerWorker:
             adam_max_second_moment = max(tensor_state['exp_avg_sq'].max().item(), adam_max_second_moment)
         stats.adam_max_second_moment = adam_max_second_moment
 
-        version_diff = var.curr_policy_version - var.mb.policy_version
+        version_diff = (var.curr_policy_version - var.mb.policy_version)[var.mb.policy_id == self.policy_id]
         stats.version_diff_avg = version_diff.mean()
         stats.version_diff_min = version_diff.min()
         stats.version_diff_max = version_diff.max()
@@ -1008,6 +1170,8 @@ class LearnerWorker:
                 eps=self.cfg.adam_eps,
             )
 
+            self.lr_scheduler = get_lr_scheduler(self.cfg)
+
             self.load_from_checkpoint(self.policy_id)
 
             self._broadcast_model_weights()  # sync the very first version of the weights
@@ -1111,18 +1275,10 @@ class LearnerWorker:
         return discarding_rate
 
     def _extract_rollouts(self, data):
-        data = AttrDict(data)
-        worker_idx, split_idx, traj_buffer_idx = data.worker_idx, data.split_idx, data.traj_buffer_idx
-
         rollouts = []
-        for rollout_data in data.rollouts:
-            env_idx, agent_idx = rollout_data['env_idx'], rollout_data['agent_idx']
-            tensors = self.rollout_tensors.index((worker_idx, split_idx, env_idx, agent_idx, traj_buffer_idx))
-
+        for rollout_data in data:
+            tensors = self.rollout_tensors.index(rollout_data['traj_buffer_idx'])
             rollout_data['t'] = tensors
-            rollout_data['worker_idx'] = worker_idx
-            rollout_data['split_idx'] = split_idx
-            rollout_data['traj_buffer_idx'] = traj_buffer_idx
             rollouts.append(AttrDict(rollout_data))
 
         return rollouts
@@ -1169,6 +1325,9 @@ class LearnerWorker:
         return total_minibatches_on_learner >= max_minibatches_on_learner
 
     def _run(self):
+        self.deferred_initialization()
+        log.info(f'LEARNER\tpid {os.getpid()}\tparent {os.getppid()}')
+
         # workers should ignore Ctrl+C because the termination is handled in the event loop by a special msg
         signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -1272,6 +1431,7 @@ class LearnerWorker:
 
     def close(self):
         self.task_queue.put((TaskType.TERMINATE, None))
+        self.shared_buffers._stop_experience_collection[self.policy_id] = False
 
     def join(self):
         join_or_kill(self.process)
